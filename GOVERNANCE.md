@@ -185,6 +185,34 @@ This section is informational. Only the "Allowed Write Objects" table above gove
 
 ---
 
+## Slack Deployment Requirements (Pre-Release Checklist)
+
+When this tool is released as a Slack-facing service, the following must be addressed before go-live:
+
+### Isolation
+- The `salesforce-admin` MCP server must **not** be deployed alongside the write server. Separation must be structural (deployment), not instructional.
+- Only the `salesforce-mcp-write` server should be exposed to the Slack integration.
+
+### Authentication
+- The current per-user OAuth flow is the right foundation — each Slack user authenticates with their own Salesforce credentials.
+- A Slack-native OAuth handshake may be needed (users authorize via a Slack slash command or button rather than a browser redirect from Claude Desktop).
+- Refresh tokens must be stored server-side, keyed by Slack user ID — not in `~/.salesforce-mcp-session.json` on a local machine.
+
+### Session Storage
+- Replace file-based token storage with a persistent, multi-user store (database or secrets manager) keyed by Slack user ID.
+- Implement token expiry and re-auth prompts surfaced through Slack.
+
+### Audit Trail
+- The current attribution model (Description field / conversation log) is insufficient for a shared service.
+- Implement a dedicated audit log: who requested the action, when, what was written, and the resulting record ID.
+- Consider a Chatter post on each created/updated record as a lightweight audit trail visible in Salesforce.
+
+### Rate Limiting & Abuse Prevention
+- Add per-user rate limiting to prevent accidental or malicious bulk writes.
+- Consider a daily write cap per user for Phase 1.
+
+---
+
 ## Change Log
 
 | Date | Change | Author |
