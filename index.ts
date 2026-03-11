@@ -1,51 +1,93 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import fetch from "node-fetch";
+import * as http from "http";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
+import { execFile } from "child_process";
+import { randomBytes, createHash } from "crypto";
 
 const SF_CLIENT_ID     = process.env.SF_CLIENT_ID!;
 const SF_CLIENT_SECRET = process.env.SF_CLIENT_SECRET!;
 const SF_LOGIN_URL     = process.env.SF_LOGIN_URL || "https://login.salesforce.com";
 const SF_API_VERSION   = process.env.SF_API_VERSION || "v60.0";
+const SF_CALLBACK_PORT = parseInt(process.env.SF_CALLBACK_PORT || "8788");
+const SF_CALLBACK_URL  = `http://localhost:${SF_CALLBACK_PORT}/oauth/callback`;
+const TOKEN_FILE       = path.join(os.homedir(), ".salesforce-mcp-session.json");
 
-let accessToken: string | null = null;
-let instanceUrl: string | null = null;
-
-async function authenticate() {
-  const params = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: SF_CLIENT_ID,
-    client_secret: SF_CLIENT_SECRET,
-  });
-  const res = await fetch(`${SF_LOGIN_URL}/services/oauth2/token`, {
-    method: "POST",
-    body: params,
-  });
-  if (!res.ok) throw new Error(`SF auth failed: ${await res.text()}`);
-  const data = (await res.json()) as any;
-  accessToken = data.access_token;
-  instanceUrl = data.instance_url;
+interface Session {
+  accessToken: string;
+  refreshToken: string;
+  instanceUrl: string;
+  userId: string;
+  username: string;
 }
 
-// Returns { ok, status, data } — never throws on SF API errors so callers can surface them.
+let session: Session | null = null;
+
+function loadSession(): Session | null {
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      return JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8")) as Session;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function saveSession(s: Session) {
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify(s, null, 2), { mode: 0o600 });
+}
+
+function clearSession() {
+  session = null;
+  try { fs.unlinkSync(TOKEN_FILE); } catch { /* ignore */ }
+}
+
+// Load persisted session on startup
+session = loadSession();
+
+async function refreshAccessToken(): Promise<boolean> {
+  if (!session?.refreshToken) return false;
+  const res = await fetch(`${SF_LOGIN_URL}/services/oauth2/token`, {
+    method: "POST",
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: SF_CLIENT_ID,
+      client_secret: SF_CLIENT_SECRET,
+      refresh_token: session.refreshToken,
+    }),
+  });
+  if (!res.ok) return false;
+  const data = (await res.json()) as any;
+  session = { ...session, accessToken: data.access_token, instanceUrl: data.instance_url };
+  saveSession(session);
+  return true;
+}
+
 async function sfRequest(method: string, path: string, body?: object): Promise<{ ok: boolean; status: number; data: any }> {
-  if (!accessToken) await authenticate();
-  const res = await fetch(`${instanceUrl}/services/data/${SF_API_VERSION}${path}`, {
+  if (!session) {
+    throw new Error("Not logged in. Use the sf_login tool to connect your Salesforce account.");
+  }
+
+  const doRequest = () => fetch(`${session!.instanceUrl}/services/data/${SF_API_VERSION}${path}`, {
     method,
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${session!.accessToken}`,
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
   });
+
+  let res = await doRequest();
+
   if (res.status === 401) {
-    await authenticate();
-    return sfRequest(method, path, body);
+    const refreshed = await refreshAccessToken();
+    if (!refreshed) throw new Error("Session expired. Use the sf_login tool to reconnect.");
+    res = await doRequest();
   }
-  // 204 No Content (PATCH success) has no body
+
   if (res.status === 204) return { ok: true, status: 204, data: null };
   const text = await res.text();
   let data: any;
@@ -53,8 +95,112 @@ async function sfRequest(method: string, path: string, body?: object): Promise<{
   return { ok: res.ok, status: res.status, data };
 }
 
-// Formats Salesforce error arrays into readable messages.
-// SF errors: [{ message, errorCode, fields }]
+// Kick off the browser-based OAuth flow. Resolves when the user finishes logging in.
+async function initiateLogin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const state = randomBytes(16).toString("hex");
+    const codeVerifier = randomBytes(64).toString("base64url");
+    const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
+
+    const authUrl = `${SF_LOGIN_URL}/services/oauth2/authorize?` + new URLSearchParams({
+      response_type: "code",
+      client_id: SF_CLIENT_ID,
+      redirect_uri: SF_CALLBACK_URL,
+      scope: "api refresh_token",
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+    });
+
+    const server = http.createServer(async (req, res) => {
+      if (!req.url?.startsWith("/oauth/callback")) return;
+
+      const url = new URL(req.url, `http://localhost:${SF_CALLBACK_PORT}`);
+      const code = url.searchParams.get("code");
+      const returnedState = url.searchParams.get("state");
+      const error = url.searchParams.get("error");
+
+      if (error) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(`<html><body><h2>❌ Login failed: ${error}</h2><p>You can close this tab.</p></body></html>`);
+        server.close();
+        reject(new Error(`Salesforce login failed: ${error} — ${url.searchParams.get("error_description") ?? ""}`));
+        return;
+      }
+
+      if (returnedState !== state || !code) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(`<html><body><h2>❌ Invalid callback</h2><p>You can close this tab.</p></body></html>`);
+        server.close();
+        reject(new Error("OAuth state mismatch or missing code"));
+        return;
+      }
+
+      try {
+        // Exchange code for tokens
+        const tokenRes = await fetch(`${SF_LOGIN_URL}/services/oauth2/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            client_id: SF_CLIENT_ID,
+            client_secret: SF_CLIENT_SECRET,
+            redirect_uri: SF_CALLBACK_URL,
+            code,
+            code_verifier: codeVerifier,
+          }),
+        });
+
+        if (!tokenRes.ok) {
+          const err = await tokenRes.text();
+          throw new Error(`Token exchange failed: ${err}`);
+        }
+
+        const tokenData = (await tokenRes.json()) as any;
+
+        // Fetch the authenticated user's info
+        const userRes = await fetch(`${tokenData.instance_url}/services/oauth2/userinfo`, {
+          headers: { Authorization: `Bearer ${tokenData.access_token}` },
+        });
+        const userInfo = (await userRes.json()) as any;
+
+        session = {
+          accessToken: tokenData.access_token,
+          refreshToken: tokenData.refresh_token,
+          instanceUrl: tokenData.instance_url,
+          userId: userInfo.user_id,
+          username: userInfo.preferred_username,
+        };
+        saveSession(session);
+
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(`<html><body><h2>✅ Connected as ${session.username}</h2><p>You can close this tab and return to Claude.</p></body></html>`);
+        server.close();
+        resolve(`✅ Logged in as ${session.username} (${session.userId})\nAll Salesforce actions will now run as this user and respect their permissions, FLS, and sharing rules.`);
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "text/html" });
+        res.end(`<html><body><h2>❌ Error</h2><p>${err.message}</p><p>You can close this tab.</p></body></html>`);
+        server.close();
+        reject(err);
+      }
+    });
+
+    server.listen(SF_CALLBACK_PORT, () => {
+      // Open browser to Salesforce login
+      execFile("open", [authUrl]);
+    });
+
+    server.on("error", (err) => {
+      reject(new Error(`Could not start callback server on port ${SF_CALLBACK_PORT}: ${err.message}`));
+    });
+
+    // Timeout after 5 minutes
+    setTimeout(() => {
+      server.close();
+      reject(new Error("Login timed out. Please try sf_login again."));
+    }, 5 * 60 * 1000);
+  });
+}
+
 function formatSfErrors(data: any): string {
   if (!Array.isArray(data)) return JSON.stringify(data);
   return data.map((e: any) => {
@@ -70,15 +216,30 @@ function sfError(data: any): string {
 }
 
 const server = new Server(
-  { name: "salesforce-mcp", version: "1.0.0" },
+  { name: "salesforce-mcp", version: "2.0.0" },
   { capabilities: { tools: {} } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
+      name: "sf_login",
+      description: "Log in to Salesforce. Opens a browser for you to authenticate with your own credentials. All subsequent actions will run as you and respect your permissions, field-level security, and sharing rules.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "sf_whoami",
+      description: "Show the currently logged-in Salesforce user.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "sf_logout",
+      description: "Log out of Salesforce and clear the stored session.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
       name: "create_opportunity",
-      description: `Create a new Salesforce Opportunity. All field requirements, validation rules, and field-level permissions are enforced by Salesforce — do not pre-validate on the client side. Pass whatever fields you have; Salesforce will return clear errors if anything is missing or invalid.`,
+      description: "Create a new Salesforce Opportunity. All field requirements, validation rules, and field-level permissions are enforced by Salesforce as the logged-in user.",
       inputSchema: {
         type: "object",
         properties: {
@@ -98,7 +259,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_opportunity",
-      description: "Retrieve Opportunities by ID or by searching on Name, AccountId, or StageName.",
+      description: "Retrieve Opportunities by ID or by searching on Name, AccountId, or StageName. Only returns records the logged-in user has access to.",
       inputSchema: {
         type: "object",
         properties: {
@@ -113,7 +274,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "update_opportunity",
-      description: "Update fields on an existing Opportunity. Salesforce enforces all validation rules, field-level permissions, and required field rules — errors are returned as-is.",
+      description: "Update fields on an existing Opportunity. Salesforce enforces all validation rules, field-level permissions, and sharing rules for the logged-in user.",
       inputSchema: {
         type: "object",
         properties: {
@@ -125,7 +286,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "create_record",
-      description: "Create a record in any Salesforce object. Salesforce enforces all permissions and validation rules.",
+      description: "Create a record in any Salesforce object. Salesforce enforces all permissions and validation rules for the logged-in user.",
       inputSchema: {
         type: "object",
         properties: {
@@ -137,7 +298,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "update_record",
-      description: "Update fields on any Salesforce record. Salesforce enforces all permissions and validation rules.",
+      description: "Update fields on any Salesforce record. Salesforce enforces all permissions and validation rules for the logged-in user.",
       inputSchema: {
         type: "object",
         properties: {
@@ -150,7 +311,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "run_soql",
-      description: "Execute a SOQL query and return results. Only returns fields the connected user has read access to.",
+      description: "Execute a SOQL query. Only returns records and fields the logged-in user has access to.",
       inputSchema: {
         type: "object",
         properties: {
@@ -161,7 +322,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_object_fields",
-      description: "List all fields on a Salesforce object that are visible to the current user.",
+      description: "List all fields on a Salesforce object that are visible to the logged-in user.",
       inputSchema: {
         type: "object",
         properties: {
@@ -177,6 +338,22 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   try {
     switch (name) {
+
+      case "sf_login": {
+        const result = await initiateLogin();
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "sf_whoami": {
+        if (!session) return { content: [{ type: "text", text: "Not logged in. Use sf_login to connect." }] };
+        return { content: [{ type: "text", text: `Logged in as ${session.username} (${session.userId})\nInstance: ${session.instanceUrl}` }] };
+      }
+
+      case "sf_logout": {
+        const username = session?.username ?? "unknown";
+        clearSession();
+        return { content: [{ type: "text", text: `✅ Logged out (was ${username})` }] };
+      }
 
       case "create_opportunity": {
         const { ok, data } = await sfRequest("POST", `/sobjects/Opportunity`, args as Record<string, unknown>);
