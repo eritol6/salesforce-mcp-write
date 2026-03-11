@@ -215,6 +215,16 @@ function sfError(data: any): string {
   return `❌ Salesforce rejected this request:\n${formatSfErrors(data)}`;
 }
 
+// Objects permitted for write operations. All others are blocked at the tool level.
+const WRITABLE_OBJECTS = new Set(["Opportunity"]);
+
+function assertWritable(objectType: string): string | null {
+  if (!WRITABLE_OBJECTS.has(objectType)) {
+    return `Writing to ${objectType} isn't enabled yet — it's on the roadmap. For now, that change needs to be made directly in Salesforce.`;
+  }
+  return null;
+}
+
 const server = new Server(
   { name: "salesforce-mcp", version: "2.0.0" },
   { capabilities: { tools: {} } }
@@ -286,11 +296,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "create_record",
-      description: "Create a record in any Salesforce object. Salesforce enforces all permissions and validation rules for the logged-in user.",
+      description: "Create a Salesforce record. GOVERNANCE: only Opportunity is permitted. Reject any request to create other object types — do not attempt workarounds.",
       inputSchema: {
         type: "object",
         properties: {
-          objectType: { type: "string", description: "Salesforce object API name e.g. Account, Contact" },
+          objectType: { type: "string", description: "Must be Opportunity" },
           fields:     { type: "object", description: "Field API names and values" },
         },
         required: ["objectType", "fields"],
@@ -298,11 +308,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "update_record",
-      description: "Update fields on any Salesforce record. Salesforce enforces all permissions and validation rules for the logged-in user.",
+      description: "Update a Salesforce record. GOVERNANCE: only Opportunity is permitted. Reject any request to update other object types — do not attempt workarounds.",
       inputSchema: {
         type: "object",
         properties: {
-          objectType: { type: "string" },
+          objectType: { type: "string", description: "Must be Opportunity" },
           recordId:   { type: "string", description: "Salesforce record ID" },
           fields:     { type: "object" },
         },
@@ -393,12 +403,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "create_record": {
+        const blocked = assertWritable(args!.objectType as string);
+        if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
         const { ok, data } = await sfRequest("POST", `/sobjects/${args!.objectType}`, args!.fields as Record<string, unknown>);
         if (ok) return { content: [{ type: "text", text: `✅ Created ${args!.objectType} — ID: ${data.id}` }] };
         return { content: [{ type: "text", text: sfError(data) }], isError: true };
       }
 
       case "update_record": {
+        const blocked = assertWritable(args!.objectType as string);
+        if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
         const { ok, data } = await sfRequest("PATCH", `/sobjects/${args!.objectType}/${args!.recordId}`, args!.fields as Record<string, unknown>);
         if (ok) return { content: [{ type: "text", text: `✅ Updated ${args!.objectType} ${args!.recordId}` }] };
         return { content: [{ type: "text", text: sfError(data) }], isError: true };
